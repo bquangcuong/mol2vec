@@ -14,7 +14,7 @@ from rdkit.Chem import PandasTools
 from gensim.models import word2vec
 import timeit
 from joblib import Parallel, delayed
-
+from rdkit.Chem.rdFingerprintGenerator import GetMorganGenerator
 
 class DfVec(object):
     """
@@ -96,7 +96,8 @@ def mol2sentence(mol, radius):
     """
     radii = list(range(int(radius) + 1))
     info = {}
-    _ = AllChem.GetMorganFingerprint(mol, radius, bitInfo=info)  # info: dictionary identifier, atom_idx, radius
+    generator = GetMorganGenerator(radius=radius, includeChirality=True)
+    fp = generator.GetFingerprint(mol, bitInfo=info)
 
     mol_atoms = [a.GetIdx() for a in mol.GetAtoms()]
     dict_atoms = {x: {r: None for r in radii} for x in mol_atoms}
@@ -369,7 +370,7 @@ def train_word2vec_model(infile_name, outfile_name=None, vector_size=100, window
   
     start = timeit.default_timer()
     corpus = word2vec.LineSentence(infile_name)
-    model = word2vec.Word2Vec(corpus, size=vector_size, window=window, min_count=min_count, workers=n_jobs, sg=sg,
+    model = word2vec.Word2Vec(corpus, vector_size=vector_size, window=window, min_count=min_count, workers=n_jobs, sg=sg,
                               **kwargs)
     if outfile_name:
         model.save(outfile_name)
@@ -422,7 +423,7 @@ def sentences2vec(sentences, model, unseen=None):
     -------
     np.array
     """
-    keys = set(model.wv.vocab.keys())
+    keys = set(model.wv.key_to_index.keys())
     vec = []
     if unseen:
         unseen_vec = model.wv.word_vec(unseen)
@@ -460,9 +461,10 @@ def featurize(in_file, out_file, model_path, r, uncommon=None):
     """
     # Load the model
     word2vec_model = word2vec.Word2Vec.load(model_path)
+    vec_size = word2vec_model.vector_size
     if uncommon:
         try:
-            word2vec_model[uncommon]
+            word2vec_model.wv[uncommon]
         except KeyError:
             raise KeyError('Selected word for uncommon: %s not in vocabulary' % uncommon)
 
@@ -491,9 +493,24 @@ def featurize(in_file, out_file, model_path, r, uncommon=None):
         df['Smiles'] = df['ROMol'].map(Chem.MolToSmiles)  # Recreate SMILES
 
     print('Featurizing molecules.')
-    df['mol-sentence'] = df.apply(lambda x: MolSentence(mol2alt_sentence(x['ROMol'], r)), axis=1)
-    vectors = sentences2vec(df['mol-sentence'], word2vec_model, unseen=uncommon)
-    df_vec = pd.DataFrame(vectors, columns=['mol2vec-%03i' % x for x in range(vectors.shape[1])])
+    df['mol-sentence'] = df['ROMol'].apply(lambda mol: MolSentence(mol2alt_sentence(mol, r)))
+    df['mol-sentence'] = df['mol-sentence'].apply(lambda s: s if len(s) > 0 else ['UNK'])
+    vectors = []
+    for i, sentence in enumerate(df['mol-sentence']):
+        try:
+            vec = sentences2vec([sentence], word2vec_model, unseen=uncommon)
+            if vec is not None and vec.shape[0] > 0 and vec[0] is not None:
+                vectors.append(vec[0])
+            else:
+                print(f"Empty vector at line {i}, using zero vector.")
+                vectors.append(np.zeros(vec_size))
+        except Exception as e:
+            print(f"Failed on line {i}: {e}, using zero vector.")
+            vectors.append(np.zeros(vec_size))
+    vec_array = np.array(vectors)
+    if vec_array.ndim != 2:
+        vec_array = np.zeros((len(vectors), word2vec_model.vector_size))
+    df_vec = pd.DataFrame(vec_array, columns=['mol2vec-%03i' % x for x in range(vec_array.shape[1])])
     df_vec.index = df.index
     df = df.join(df_vec)
 
